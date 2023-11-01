@@ -337,13 +337,16 @@ async fn start_safekeeper(conf: SafeKeeperConf) -> Result<()> {
         e
     })?;
 
+    //! timeline_collector has several vectors for metrics, for example commit_lsn, flush_lsn, etc.
     // Register metrics collector for active timelines. It's important to do this
     // after daemonizing, otherwise process collector will be upset.
     let timeline_collector = safekeeper::metrics::TimelineCollector::new();
     metrics::register_internal(Box::new(timeline_collector))?;
 
+    //! Initialize a multi-producer, single-consumer channel for communication
     let (wal_backup_launcher_tx, wal_backup_launcher_rx) = mpsc::channel(100);
 
+    //! Asynchronously event queue
     // Keep handles to main tasks to die if any of them disappears.
     let mut tasks_handles: FuturesUnordered<BoxFuture<(String, JoinTaskRes)>> =
         FuturesUnordered::new();
@@ -374,6 +377,7 @@ async fn start_safekeeper(conf: SafeKeeperConf) -> Result<()> {
         info!("running in current thread runtime");
     }
 
+    //! wal_service::task_main handle incoming TCP connections
     let wal_service_handle = current_thread_rt
         .as_ref()
         .unwrap_or_else(|| WAL_SERVICE_RUNTIME.handle())

@@ -606,11 +606,16 @@ impl Timeline {
         let commit_lsn: Lsn;
         let term_flush_lsn: TermLsn;
         {
+            //! Transfer this message to the safekeeper.
+            //! Safekeeper will parse this message to Greeting, Append, Elected, AppendNoFlush and etc
+            //! and then process it.
+            //! write_shared_state() will lock the state.
             let mut shared_state = self.write_shared_state().await;
             rmsg = shared_state.sk.process_msg(msg).await?;
 
             // if this is AppendResponse, fill in proper pageserver and hot
             // standby feedback.
+            //! Prepare the response message to the PageServer and hot standby. Not related with this disk flush.
             if let Some(AcceptorProposerMessage::AppendResponse(ref mut resp)) = rmsg {
                 let (ps_feedback, hs_feedback) = self.walsenders.get_feedbacks();
                 resp.hs_feedback = hs_feedback;
@@ -621,6 +626,7 @@ impl Timeline {
             term_flush_lsn =
                 TermLsn::from((shared_state.sk.get_term(), shared_state.sk.flush_lsn()));
         }
+        //! Send the updated commit_lsn and term_flush_lsn to all background jobs.
         self.commit_lsn_watch_tx.send(commit_lsn)?;
         self.term_flush_lsn_watch_tx.send(term_flush_lsn)?;
         Ok(rmsg)

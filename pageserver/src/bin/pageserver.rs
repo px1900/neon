@@ -248,7 +248,7 @@ fn startup_checkpoint(started_at: Instant, phase: &str, human_phase: &str) {
 }
 
 fn start_pageserver(
-    launch_ts: &'static LaunchTimestamp,
+    aunch_ts: &'static LaunchTimestamp,
     conf: &'static PageServerConf,
 ) -> anyhow::Result<()> {
     // Monotonic time for later calculating startup duration

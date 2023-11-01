@@ -379,6 +379,7 @@ impl SafekeeperPostgresHandler {
         term: Option<Term>,
     ) -> Result<(), CopyStreamHandlerEnd> {
         let appname = self.appname.clone();
+        //! Get the target timeline using tenantid from the connection.
         let tli =
             GlobalTimelines::get(self.ttid).map_err(|e| CopyStreamHandlerEnd::Other(e.into()))?;
 
@@ -402,6 +403,7 @@ impl SafekeeperPostgresHandler {
         // WAL getting concurrently garbaged if another compute rises which
         // collects majority and starts fixing log on this safekeeper itself.
         // That's ok as (old) proposer will never be able to commit such WAL.
+        //! Get the end position of the WAL stream.
         let end_watch = if self.is_walproposer_recovery() {
             EndWatch::Flush(tli.get_term_flush_lsn_watch_rx())
         } else {
@@ -429,6 +431,7 @@ impl SafekeeperPostgresHandler {
         pgb.write_message(&BeMessage::CopyBothResponse).await?;
 
         let (_, persisted_state) = tli.get_state().await;
+        //! Initialize a WalReader to read the target timeline starts from start_pos
         let wal_reader = WalReader::new(
             self.conf.workdir.clone(),
             self.conf.timeline_dir(&tli.ttid),
@@ -439,8 +442,13 @@ impl SafekeeperPostgresHandler {
 
         // Split to concurrently receive and send data; replies are generally
         // not synchronized with sends, so this avoids deadlocks.
+        //! Split the read/write socket to reader and writer. The PostgresBackend will maintain
+        //! the writer socket, and return the reader socket to us.
         let reader = pgb.split().context("START_REPLICATION split")?;
 
+        //! Initialize a WalSender to send the WAL to the client from start_pos to end_pos.
+        //! WalSender will use the socket writer. And the ReplyReader will take responsibility
+        //! to read the feedbacks from the client.
         let mut sender = WalSender {
             pgb,
             tli: tli.clone(),
@@ -531,6 +539,8 @@ impl<IO: AsyncRead + AsyncWrite + Unpin> WalSender<'_, IO> {
             // Wait for the next portion if it is not there yet, or just
             // update our end of WAL available for sending value, we
             // communicate it to the receiver.
+            //! The "start_pos" WAL may currently not received by safekeeper,
+            //! So, wait_wal will wait for any WAL arrival that has LSN larger than start_pos.
             self.wait_wal().await?;
             assert!(
                 self.end_pos > self.start_pos,

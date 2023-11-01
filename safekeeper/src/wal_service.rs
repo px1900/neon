@@ -27,15 +27,18 @@ pub async fn task_main(
     // Tokio's from_std won't do this for us, per its comment.
     pg_listener.set_nonblocking(true)?;
 
+    //! Start Listening for incoming connections
     let listener = tokio::net::TcpListener::from_std(pg_listener)?;
     let mut connection_count: ConnectionCount = 0;
 
     loop {
+        //! Got a connection, save its info to socket and peer_addr
         let (socket, peer_addr) = listener.accept().await.context("accept")?;
         debug!("accepted connection from {}", peer_addr);
         let conf = conf.clone();
         let conn_id = issue_connection_id(&mut connection_count);
 
+        //! Spawn a new task to process each connection ASYNCHRONOUSLY
         tokio::spawn(
             async move {
                 if let Err(err) = handle_socket(socket, conf, conn_id, allowed_auth_scope).await {
@@ -56,8 +59,10 @@ async fn handle_socket(
     allowed_auth_scope: Scope,
 ) -> Result<(), QueryError> {
     socket.set_nodelay(true)?;
+    //! Peer_addr is the remote address of the socket
     let peer_addr = socket.peer_addr()?;
 
+    //! Set timeout to realize keepalive feature.
     // Set timeout on reading from the socket. It prevents hanged up connection
     // if client suddenly disappears. Note that TCP_KEEPALIVE is not enabled by
     // default, and tokio doesn't provide ability to set it out of the box.
@@ -70,6 +75,7 @@ async fn handle_socket(
     // shouldn't be moved.
     tokio::pin!(socket);
 
+    //! Warp socket with MeasuredStream to record traffic metrics
     let traffic_metrics = TrafficMetrics::new();
     if let Some(current_az) = conf.availability_zone.as_deref() {
         traffic_metrics.set_sk_az(current_az);
@@ -85,17 +91,24 @@ async fn handle_socket(
         },
     );
 
+    //! Guess: scope is whether this connection can access all safekeepers or just one tenant(safekeeper).
     let auth_key = match allowed_auth_scope {
         Scope::Tenant => conf.pg_tenant_only_auth.clone(),
         _ => conf.pg_auth.clone(),
     };
+    //! NeonJWT is a JWT token that is used to authenticate safekeeper to pageserver? (not sure)
+    //! But it seems like password that belong to Neon.
     let auth_type = match auth_key {
         None => AuthType::Trust,
         Some(_) => AuthType::NeonJWT,
     };
     let auth_pair = auth_key.map(|key| (allowed_auth_scope, key));
+    //! conn_handler is now a PostgreSQL command specific handler, instead of a generic TCP handler.
     let mut conn_handler =
         SafekeeperPostgresHandler::new(conf, conn_id, Some(traffic_metrics.clone()), auth_pair);
+    //! This pgbackend warp the socket again with connection status and authentication type, etc.
+    //! The connection status includes waiting handshake, waiting authentication, etc.
+    //! Now, after new_from_io, the pgbackend status is Initialized.
     let pgbackend = PostgresBackend::new_from_io(socket, peer_addr, auth_type, None)?;
     // libpq protocol between safekeeper and walproposer / pageserver
     // We don't use shutdown.

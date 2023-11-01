@@ -56,6 +56,8 @@ fn parse_cmd(cmd: &str) -> anyhow::Result<SafekeeperPostgresCommand> {
     if cmd.starts_with("START_WAL_PUSH") {
         Ok(SafekeeperPostgresCommand::StartWalPush)
     } else if cmd.starts_with("START_REPLICATION") {
+        //! I guess "START_REPLICATION" is the command that a postgres instance wants to copy wals from safekeeper,
+        //! which starts from start_lsn
         let re = Regex::new(
             // We follow postgres START_REPLICATION LOGICAL options to pass term.
             r"START_REPLICATION(?: SLOT [^ ]+)?(?: PHYSICAL)? ([[:xdigit:]]+/[[:xdigit:]]+)(?: \(term='(\d+)'\))?",

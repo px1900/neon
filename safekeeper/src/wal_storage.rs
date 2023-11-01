@@ -566,6 +566,10 @@ impl WalReader {
     }
 
     pub async fn read(&mut self, buf: &mut [u8]) -> Result<usize> {
+        //! If self.pos < self.timeline_start_lsn, then this pos is in the same segment with
+        //! self.timeline_start_lsn, and we should return 0s for the bytes before self.timeline_start_lsn.
+        //! Segment_x [...self.pos ... self.timeline_start_lsn ...]
+        //! should return [ (000) self.pos (000) self.timeline_start_lsn ...]
         // If this timeline is new, we may not have a full segment yet, so
         // we pad the first bytes of the timeline's first WAL segment with 0s
         if self.pos < self.timeline_start_lsn {
@@ -616,6 +620,9 @@ impl WalReader {
 
             return Ok(len);
         }
+
+        //! Read as much as possible from the current WAL segment, til the
+        //! end of the segment or the end of received WAL.
 
         let mut wal_segment = match self.wal_segment.take() {
             Some(reader) => reader,
