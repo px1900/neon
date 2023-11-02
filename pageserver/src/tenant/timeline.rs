@@ -200,6 +200,7 @@ pub struct Timeline {
     /// See [`remote_timeline_client`](super::remote_timeline_client) module comment for details.
     pub remote_client: Option<Arc<RemoteTimelineClient>>,
 
+    //! last WAL been put into InMemLayer
     // What page versions do we hold in the repository? If we get a
     // request > last_record_lsn, we need to wait until we receive all
     // the WAL up to the request. The SeqWait provides functions for
@@ -487,6 +488,8 @@ impl Timeline {
             None => None,
         };
 
+        //! The records will collect matched WAL records between cached_lsn and lsn.
+        //! The cached_page_img may be None if there is no cached page for the key.
         let mut reconstruct_state = ValueReconstructState {
             records: Vec::new(),
             img: cached_page_img,
@@ -2015,6 +2018,7 @@ impl Timeline {
         // through. It's included in the error message if we fail to find the key.
         let mut traversal_path = Vec::<TraversalPathItem>::new();
 
+        //! Get the basePage LSN, if basePage not exist in cache, set LSN as 0
         let cached_lsn = if let Some((cached_lsn, _)) = &reconstruct_state.img {
             *cached_lsn
         } else {
@@ -2026,8 +2030,12 @@ impl Timeline {
         // looping if something goes wrong.
         let mut prev_lsn = Lsn(u64::MAX);
 
+        //! Continue means we need to keep searching its predecessor layer
         let mut result = ValueReconstructResult::Continue;
+        //! Cont_lsn is parameter LSN + 1
         let mut cont_lsn = Lsn(request_lsn.0 + 1);
+
+        //! predecessor_layer: [... predecessor_lsn] current_layer:( predecessor_lsn .... parameter_lsn, cont_lsn, ... prev_lsn(MAX) )
 
         'outer: loop {
             // The function should have updated 'state'
@@ -2036,6 +2044,7 @@ impl Timeline {
                 ValueReconstructResult::Complete => return Ok(traversal_path),
                 ValueReconstructResult::Continue => {
                     // If we reached an earlier cached page image, we're done.
+                    //! todo
                     if cont_lsn == cached_lsn + 1 {
                         MATERIALIZED_PAGE_CACHE_HIT.inc_by(1);
                         return Ok(traversal_path);

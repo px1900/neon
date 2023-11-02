@@ -303,6 +303,8 @@ fn start_pageserver(
     info!("Starting pageserver pg protocol handler on {pg_addr}");
     let pageserver_listener = tcp_listener::bind(pg_addr)?;
 
+    //! Broker is a publisher - subscriber model that implemented with grpc(tokio)
+    //! It can subscribe to one or more timelines from Safekeepers to receive WAL records
     // Launch broker client
     // The storage_broker::connect call needs to happen inside a tokio runtime thread.
     let broker_client = WALRECEIVER_RUNTIME
@@ -364,9 +366,13 @@ fn start_pageserver(
     // Top-level cancellation token for the process
     let shutdown_pageserver = tokio_util::sync::CancellationToken::new();
 
+    //! The remote storage is a trait that wrapped the code to access the storage.
+    //! The remote storage types include localFs, S3, AzureBlob and Unreliable.
     // Set up remote storage client
     let remote_storage = create_remote_storage_client(conf)?;
 
+    //! This deletion queue is used to accumulate delete requests to remote storage (like S3)
+    //! and execute them in batches.
     // Set up deletion queue
     let (deletion_queue, deletion_workers) = DeletionQueue::new(
         remote_storage.clone(),
@@ -531,6 +537,7 @@ fn start_pageserver(
     // been configured.
     let disk_usage_eviction_state: Arc<disk_usage_eviction_task::State> = Arc::default();
 
+    //! Launch remote storage
     if let Some(remote_storage) = &remote_storage {
         launch_disk_usage_global_eviction_task(
             conf,
@@ -542,6 +549,7 @@ fn start_pageserver(
 
     // Start up the service to handle HTTP mgmt API request. We created the
     // listener earlier already.
+    //! Router is Get/Post Request_addr to Api_handler
     {
         let _rt_guard = MGMT_REQUEST_RUNTIME.enter();
 
