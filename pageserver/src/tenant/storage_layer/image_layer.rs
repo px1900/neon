@@ -214,6 +214,7 @@ impl ImageLayer {
         Ok(())
     }
 
+    /// Create a temporary file name for a image file.
     fn temp_path_for(
         conf: &PageServerConf,
         timeline_id: TimelineId,
@@ -246,6 +247,7 @@ impl ImageLayer {
             .with_context(|| format!("Failed to load image layer {}", self.path()))
     }
 
+    /// The main work is ImageLayerInner::load, which is called by this function.
     async fn load_inner(&self, ctx: &RequestContext) -> Result<ImageLayerInner> {
         let path = self.path();
 
@@ -295,6 +297,12 @@ impl ImageLayer {
 }
 
 impl ImageLayerInner {
+    // Load an image layer from disk.
+    // 1. Open a file using the given path.
+    // 2. Read the summary block.
+    // 3. Verify the summary block matches the expected summary.
+    // 4. Return the file and the summary block.
+    // Note that parameter Lsn is only used to be wrapped in the return result.
     pub(super) async fn load(
         path: &Utf8Path,
         lsn: Lsn,
@@ -330,6 +338,9 @@ impl ImageLayerInner {
         })
     }
 
+    /// Fetch a page from file.
+    /// First, check the B-Tree index to find the offset of the page.
+    /// Then, read the page using the offset.
     pub(super) async fn get_value_reconstruct_data(
         &self,
         key: Key,
@@ -393,6 +404,14 @@ struct ImageLayerWriterInner {
     tree: DiskBtreeBuilder<BlockBuf, KEY_SIZE>,
 }
 
+/// XI Note;
+/// This function works to initialize a new image layer file and file writer.
+///
+/// 1. Create a new file with a temporary name.
+/// 2. Create a new blob writer.
+/// 3. Create a new B-Tree writer.
+/// 4. Initialize the ImageLayerWriterInner struct using the above objects.
+///
 impl ImageLayerWriterInner {
     ///
     /// Start building a new image layer.
@@ -448,6 +467,8 @@ impl ImageLayerWriterInner {
     ///
     /// The page versions must be appended in blknum order.
     ///
+    /// 1. Append the image to the blob file.
+    /// 2. Append this offset to a B-Tree node corresponding to the key.
     async fn put_image(&mut self, key: Key, img: &[u8]) -> anyhow::Result<()> {
         ensure!(self.key_range.contains(&key));
         let off = self.blob_writer.write_blob(img).await?;
@@ -462,7 +483,19 @@ impl ImageLayerWriterInner {
     ///
     /// Finish writing the image layer.
     ///
+    /// XI Note:
+    /// The image layer data arrangement is as follows:
+    /// [header BLK - 1 BLK] [Images BLKS] [Index BLKS]
+    ///
+    /// 1. Write the index to the file
+    /// 2. Write the header to the file
+    /// 3. Generate a PersistentImageLayer object to call Layer::finish_creating functions
+    ///     by this function, it will rename the current temp_path file to the final path (name).
     async fn finish(self, timeline: &Arc<Timeline>) -> anyhow::Result<ResidentLayer> {
+        // If blob size is 16K exactly. Then the index_start_blk = 2.999 /1 = 2. Which means start from third page.
+        // If blob size is 16K + 1. Then the index_start_blk = 3.000 /1 = 3. Which means start from fourth page.
+        // If blob size is 24K - 1. Then the index_start_blk = 3.999 /1 = 3. Which means start from fourth page.
+        // So the index_start_blk is always the next page after the last page of the blob.
         let index_start_blk =
             ((self.blob_writer.size() + PAGE_SZ as u64 - 1) / PAGE_SZ as u64) as u32;
 
@@ -471,6 +504,10 @@ impl ImageLayerWriterInner {
         // Write out the index
         file.seek(SeekFrom::Start(index_start_blk as u64 * PAGE_SZ as u64))
             .await?;
+        // XI Note: By annotation, the tree.finish will flush everything to the disk.
+        // However it seems the tree.finish only write the tree into block_buf.
+        // And the index_root_blk seems to be an internal root location of the tree,
+        // instead of the block number of the blob file.
         let (index_root_blk, block_buf) = self.tree.finish()?;
         for buf in block_buf.blocks {
             file.write_all(buf.as_ref()).await?;
@@ -549,6 +586,10 @@ impl ImageLayerWriterInner {
 /// implementation that cleans up the temporary file in failure. It's not
 /// possible to do this directly in `ImageLayerWriterInner` since `finish` moves
 /// out some fields, making it impossible to implement `Drop`.
+///
+/// XI Note:
+/// Wrapper for ImageLayerWriterInner.
+/// Add a Drop implementation to clean up the temporary file in failure.
 ///
 #[must_use]
 pub struct ImageLayerWriter {
