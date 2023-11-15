@@ -59,6 +59,10 @@ impl std::fmt::Debug for InMemoryLayer {
     }
 }
 
+/// index:
+///     page_a: VecMap<lsn, offset>
+///     page_b: VecMap<lsn, offset>
+///     ...
 pub struct InMemoryLayerInner {
     /// All versions of all pages in the layer are kept here.  Indexed
     /// by block number and LSN. The value is an offset into the
@@ -107,6 +111,9 @@ impl InMemoryLayer {
     /// debugging function to print out the contents of the layer
     ///
     /// this is likely completly unused
+    ///
+    /// Iterate all xlogs in emphemeral file with the help of index iterator, and
+    /// print out the xlog length and type (Image or WalRecord).
     pub async fn dump(&self, verbose: bool, ctx: &RequestContext) -> Result<()> {
         let inner = self.inner.read().await;
 
@@ -154,6 +161,21 @@ impl InMemoryLayer {
     }
 
     /// Look up given value in the layer.
+    /// XI Note:
+    ///    This function aims to return enough information to reconstruct the value.
+    ///    If the returned information is enough, then return value is complete, otherwise, continue.
+    ///    The returned information is stored in reconstruct_state.
+    ///    The returned information is considered to be sufficient when there are a base page and all
+    ///        the wal records that newer than the base page.
+    ///
+    ///    The function works as follows:
+    ///     1. Find the vector<lsn, offset> for the given pageID.
+    ///     2. Scan the vector backwards, starting from the parameter lsn_range.end_lsn, ending at lsn_range.start_lsn.
+    ///     3. Read the file content, if the content is a incremental WAL then add this WAL to the reconstruct_state.
+    ///            else if the WAL is an image, use this image as base page and stop the scan, and return complete.
+    ///
+    ///     One thing to note is that apart from Image-WAL, there is a WAL type with will_init flag, which is usually
+    ///     donates this WAL is the first XLog for this page. So, the base page is a standard blank page.
     pub(crate) async fn get_value_reconstruct_data(
         &self,
         key: Key,
@@ -186,6 +208,8 @@ impl InMemoryLayer {
                     Value::WalRecord(rec) => {
                         let will_init = rec.will_init();
                         reconstruct_state.records.push((*entry_lsn, rec));
+                        // will_init doesn't mean this is an image type xlog, it usually donates this is the first xlog
+                        // for this page, so the base page is a standard blank page.
                         if will_init {
                             // This WAL record initializes the page, so no need to go further back
                             need_image = false;
@@ -250,6 +274,16 @@ impl InMemoryLayer {
 
     /// Common subroutine of the public put_wal_record() and put_page_image() functions.
     /// Adds the page version to the in-memory tree
+    ///
+    /// XI Note:
+    /// This function does two works.
+    /// 1. Write the Value parameter into the emphemeral file.
+    /// 2. Append the (key, (lsn, offset)) into the index.
+    ///
+    /// Note that when writing the Value into the file, the Value is serialized into buffer implemented
+    /// by smallvec. This smallvec are initially allocated on stack for 256 u8 size which will guarantee
+    /// no need to allocate on heap for most cases. If the value size is larger than 256 u8, it will be
+    /// spilled to heap.
     pub async fn put_value(
         &self,
         key: Key,
@@ -298,6 +332,9 @@ impl InMemoryLayer {
     /// Make the layer non-writeable. Only call once.
     /// Records the end_lsn for non-dropped layers.
     /// `end_lsn` is exclusive
+    ///
+    /// Set the end_lsn of this layer.
+    /// Then check that all the LSNs in the index are less than the end_lsn.
     pub async fn freeze(&self, end_lsn: Lsn) {
         let inner = self.inner.write().await;
 
@@ -314,6 +351,9 @@ impl InMemoryLayer {
     /// Write this frozen in-memory layer to disk.
     ///
     /// Returns a new delta layer with all the same data as this in-memory layer
+    /// Xi Note:
+    ///
+    /// todo
     pub(crate) async fn write_to_disk(
         &self,
         timeline: &Arc<Timeline>,

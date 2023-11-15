@@ -60,6 +60,10 @@ impl From<&PersistentLayerDesc> for LayerKey {
 /// Allows answering layer map queries very efficiently,
 /// but doesn't allow retroactive insertion, which is
 /// sometimes necessary. See BufferedHistoricLayerCoverage.
+///
+/// Xi Note: This the entire Layer tree structure.
+///     For one compute nodes, it will only have one status which
+///     will maps to $historic one value. The key is the status LSN.
 pub struct HistoricLayerCoverage<Value> {
     /// The latest state
     head: LayerCoverageTuple<Value>,
@@ -87,6 +91,9 @@ impl<Value: Clone> HistoricLayerCoverage<Value> {
     /// Panics if new layer has older lsn.start than an existing layer.
     /// See BufferedHistoricLayerCoverage for a more general insertion method.
     pub fn insert(&mut self, layer_key: LayerKey, value: Value) {
+        // XI: Get the latest version map. And then check whether this maps oldest LSN
+        //     is larger than the inserting layer's oldest LSN. If yes, panic.
+        //     One question, why don't directly use the self.head to check?
         // It's only a persistent map, not a retroactive one
         if let Some(last_entry) = self.historic.iter().next_back() {
             let last_lsn = last_entry.0;
@@ -95,6 +102,8 @@ impl<Value: Clone> HistoricLayerCoverage<Value> {
             }
         }
 
+        // XI: Insert the new layer into the latest version map.
+        //     And insert this updated version map into the historic map.
         // Insert into data structure
         let target = if layer_key.is_image {
             &mut self.head.image_coverage
@@ -109,6 +118,7 @@ impl<Value: Clone> HistoricLayerCoverage<Value> {
     }
 
     /// Query at a particular LSN, inclusive
+    /// XI: Get the suitable version map for a compute node.
     pub fn get_version(&self, lsn: u64) -> Option<&LayerCoverageTuple<Value>> {
         match self.historic.range(..=lsn).next_back() {
             Some((_, v)) => Some(v),
@@ -455,6 +465,15 @@ impl<Value: Clone> BufferedHistoricLayerCoverage<Value> {
         self.buffer.insert(layer_key, None);
     }
 
+    /// The recent layers are cached inside the buffer.
+    /// This function works as follows:
+    /// 1. Empty the buffer to self.layers
+    ///    self.layer is a B-Tree that record the latest layer.
+    /// 2. Trim the layers from historic_coverage which are newer than rebuild_since (smallest LSN in buffer)
+    /// 3. Rebuild layers in the historic_coverage that LSN is larger than rebuild_since from self.layers
+    ///
+    /// Note: each new insert to persistent RedBlackTree will generate a new version of the LayerCoverage.
+    ///        However, the historic_coverage only record the necessary version of the tree in its history.
     pub fn rebuild(&mut self) {
         // Find the first LSN that needs to be rebuilt
         let rebuild_since: u64 = match self.buffer.iter().next() {

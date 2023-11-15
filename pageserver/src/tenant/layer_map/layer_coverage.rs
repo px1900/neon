@@ -15,6 +15,9 @@ use rpds::RedBlackTreeMapSync;
 ///
 /// NOTE The struct is parameterized over Value for easier
 ///      testing, but in practice it's some sort of layer.
+
+// Key is RelationId, Value is (lsn.end, LayerFile)
+// One LayerCoverage is a map for one layer.
 pub struct LayerCoverage<Value> {
     /// For every change in coverage (as we sweep the key space)
     /// we store (lsn.end, value).
@@ -53,6 +56,7 @@ impl<Value: Clone> LayerCoverage<Value> {
     ///
     /// Complexity: O(log N)
     fn add_node(&mut self, key: i128) {
+        // In fact, the range.last returns the biggest key that is less than or equal to the given key.
         let value = match self.nodes.range(..=key).last() {
             Some((_, Some(v))) => Some(v.clone()),
             Some((_, None)) => None,
@@ -64,6 +68,22 @@ impl<Value: Clone> LayerCoverage<Value> {
     /// Insert a layer.
     ///
     /// Complexity: worst case O(N), in practice O(log N). See NOTE in implementation.
+    ///
+    /// XI Note:
+    /// 1. Add two keys to the tree, and the their value copy the previously key's value.
+    ///    After, insertion, the tree is same with the previous tree. The only difference is
+    ///    that it has two more redundant keys.
+    /// 2. Now, we need to update the lsn's LSN and values in the tree.
+    ///    We iterate all the keys in the range [key.start, key.end).
+    ///    For the value of each key, if it is None, it means that this key hasn't been recorded
+    ///    in the layer, so we need to update it. Similar, if there is a layer exists for this key,
+    ///    but this layer is outdated now, which means the existed layer's lsn.end is smaller than
+    ///    the new parameter lsn.end, we need to update this key's LSN and value.
+    /// 3. For all the keys that need to be updated, we need to update their values and LSNs to the
+    ///    latest parameter one. But one exception is that, if the continuously previous key has been
+    ///    updated to the newest, and the current key is also required to be updated to newest one,
+    ///    we will have two continuous key with same LSN and same value, which is redundant and will
+    ///    cause performance drop for searching. So, in this case we will delete the current key from tree.
     pub fn insert(&mut self, key: Range<i128>, lsn: Range<u64>, value: Value) {
         // Add nodes at endpoints
         //
@@ -110,6 +130,14 @@ impl<Value: Clone> LayerCoverage<Value> {
     /// Get the latest (by lsn.end) layer at a given key
     ///
     /// Complexity: O(log N)
+    ///
+    /// Xi Note:
+    /// If the tree has five nodes: key_1, key_50, key_100, key_150, key_200
+    /// The key_1 manages the key range [1, 50)
+    /// The key_50 manages the key range [50, 100) and so on.
+    /// So, for example, there is a key_60 coming.
+    /// The range() will return [key_1, key_50],
+    ///    then the next_back() will return key_50, which manages the key_60
     pub fn query(&self, key: i128) -> Option<Value> {
         self.nodes
             .range(..=key)
@@ -123,6 +151,9 @@ impl<Value: Clone> LayerCoverage<Value> {
     /// want to start with self.query(key.start), and then follow up with self.range
     ///
     /// Complexity: O(log N + result_size)
+    ///
+    /// Xi Note:
+    /// It seems the value format is a compound and the true value is the second element.
     pub fn range(&self, key: Range<i128>) -> impl '_ + Iterator<Item = (i128, Option<Value>)> {
         self.nodes
             .range(key)
@@ -138,6 +169,9 @@ impl<Value: Clone> LayerCoverage<Value> {
 }
 
 /// Image and delta coverage at a specific LSN.
+/// Xi Note:
+/// For a specific time (specific status/LSN), one compute node will maps to one LayerCoverageTuple.
+/// Inside this tuple, there are two LayerCoverage, one is image_coverage, the other is delta_coverage.
 pub struct LayerCoverageTuple<Value> {
     pub image_coverage: LayerCoverage<Value>,
     pub delta_coverage: LayerCoverage<Value>,

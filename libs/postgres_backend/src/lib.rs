@@ -328,7 +328,7 @@ impl<IO: AsyncRead + AsyncWrite + Unpin> PostgresBackend<IO> {
         if let ProtoState::Closed = self.state {
             Ok(None)
         } else {
-            //! framed is the socket stream.
+            // framed is the socket stream.
             match self.framed.read_message().await {
                 Ok(m) => {
                     trace!("read msg {:?}", m);
@@ -466,9 +466,9 @@ impl<IO: AsyncRead + AsyncWrite + Unpin> PostgresBackend<IO> {
         )? {
             trace!("got message {:?}", msg);
 
-            //! Let the upper handler to deal with the message.
-            //! For example, for Safekepper, it will use safekeeperPostgresHandler to handle the message,
-            //! which includes StartWalPush, StartReplication ant etc.
+            // Let the upper handler to deal with the message.
+            // For example, for Safekepper, it will use safekeeperPostgresHandler to handle the message,
+            // which includes StartWalPush, StartReplication ant etc.
             let result = self.process_message(handler, msg, &mut query_string).await;
             tokio::select!(
                 biased;
