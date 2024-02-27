@@ -335,7 +335,7 @@ impl InMemoryLayer {
     /// Records the end_lsn for non-dropped layers.
     /// `end_lsn` is exclusive
     ///
-    /// Set the end_lsn of this layer.
+    /// XI: Set the end_lsn of this layer.
     /// Then check that all the LSNs in the index are less than the end_lsn.
     pub async fn freeze(&self, end_lsn: Lsn) {
         let inner = self.inner.write().await;

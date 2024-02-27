@@ -19,6 +19,8 @@ use crate::{
 };
 
 /// Provides semantic APIs to manipulate the layer map.
+/// XI: The LayerMap is an index from LSN-Key-Range to Layer Descriptor.
+///     The LayerFileManager is a map from Layer Descriptor to Layer (which manages the file operations).
 pub(crate) struct LayerManager {
     layer_map: LayerMap,
     layer_fmgr: LayerFileManager<Layer>,
@@ -32,6 +34,7 @@ impl LayerManager {
         }
     }
 
+    //XI: Get the layer from LayerFileManager(HashMap) by a PersistentLayerDesc.
     pub(crate) fn get_from_desc(&self, desc: &PersistentLayerDesc) -> Layer {
         self.layer_fmgr.get_from_desc(desc)
     }
@@ -47,26 +50,44 @@ impl LayerManager {
     /// Called from `load_layer_map`. Initialize the layer manager with:
     /// 1. all on-disk layers
     /// 2. next open layer (with disk disk_consistent_lsn LSN)
+    ///
+    /// XI: This function works to startup the database.
+    ///     During startup, the database will load all the layers from disk, and call this function
+    ///     to initialize the layer manager. It will insert each disk layer to layer_map (maps from
+    ///     LSN-Key-Range to Layer Descriptor) and file manager (maps from Layer Descriptor to Layer).
+    ///     It will also set the next open layer at the disk_consistent_lsn, which is used to create
+    ///     the first open layer after starting up.
     pub(crate) fn initialize_local_layers(
         &mut self,
         on_disk_layers: Vec<Layer>,
         next_open_layer_at: Lsn,
     ) {
+        //XI: updates is a vector to temporarily cache the updates and batch flush them when it was dropped.
         let mut updates = self.layer_map.batch_update();
+
+        //XI: Insert each layer into the layer map(index from LSN-Key-Range to Layer Descriptor) and
+        //    file manager (map from Layer Descriptor to Layer).
         for layer in on_disk_layers {
             Self::insert_historic_layer(layer, &mut updates, &mut self.layer_fmgr);
         }
+        //XI: Indeed do nothing.
         updates.flush();
+        //XI: It helps to create the first open layer after starting up.
         self.layer_map.next_open_layer_at = Some(next_open_layer_at);
     }
 
     /// Initialize when creating a new timeline, called in `init_empty_layer_map`.
+    /// XI: This function works to startup the database without any existing layer (data?).
     pub(crate) fn initialize_empty(&mut self, next_open_layer_at: Lsn) {
         self.layer_map.next_open_layer_at = Some(next_open_layer_at);
     }
 
     /// Open a new writable layer to append data if there is no open layer, otherwise return the current open layer,
     /// called within `get_layer_for_write`.
+    ///
+    /// XI: The last_record_lsn is only used to check that current lsn is greater than the last_record_lsn.
+    ///     This function also checked when there is an existing open layer, the open layer's start lsn should
+    ///     be smaller than the incoming lsn.
     pub(crate) async fn get_layer_for_write(
         &mut self,
         lsn: Lsn,
@@ -122,6 +143,10 @@ impl LayerManager {
     }
 
     /// Called from `freeze_inmem_layer`, returns true if successfully frozen.
+    /// XI: 1. Set the end_lsn to the open layer, and do some correctness check. -> open_layer.freeze()
+    ///     2. Append this open layer to the frozen_layers vector.
+    ///     3. Set the next_open_layer_at to the end_lsn.
+    ///     4. Set the return value $last_freeze_at to the end_lsn.
     pub(crate) async fn try_freeze_in_memory_layer(
         &mut self,
         Lsn(last_record_lsn): Lsn,
@@ -132,6 +157,7 @@ impl LayerManager {
         if let Some(open_layer) = &self.layer_map.open_layer {
             let open_layer_rc = Arc::clone(open_layer);
             // Does this layer need freezing?
+            // XI: Just set the end_lsn to the open layer, and do some correctness check.
             open_layer.freeze(end_lsn).await;
 
             // The layer is no longer open, update the layer map to reflect this.
@@ -144,6 +170,8 @@ impl LayerManager {
     }
 
     /// Add image layers to the layer map, called from `create_image_layers`.
+    /// XI: Insert the new image layers to the layer map and file manager.
+    ///     Also record the new layers' metrics.
     pub(crate) fn track_new_image_layers(
         &mut self,
         image_layers: &[ResidentLayer],
@@ -162,12 +190,20 @@ impl LayerManager {
     }
 
     /// Flush a frozen layer and add the written delta layer to the layer map.
+    ///
+    /// XI: 1. Get the first(oldest) inmem layer from the frozen_layers vector.
+    ///     2. Insert the parameter delta_layer to the layer map and file manager.
+    ///     Question: Where does the caller function get the delta_layer?
+    ///               It seems we just simply discard the inmem layer.
+    ///               I guess the caller function initialize the delta_layer with the inmem layer
+    ///               before calling this function.
     pub(crate) fn finish_flush_l0_layer(
         &mut self,
         delta_layer: Option<&ResidentLayer>,
         frozen_layer_for_check: &Arc<InMemoryLayer>,
         metrics: &TimelineMetrics,
     ) {
+        //XI: Get the first(oldest) inmem layer from the frozen_layers vector.
         let inmem = self
             .layer_map
             .frozen_layers
@@ -180,6 +216,8 @@ impl LayerManager {
         assert_eq!(Arc::as_ptr(&inmem), Arc::as_ptr(frozen_layer_for_check));
 
         if let Some(l) = delta_layer {
+            // XI: The $updates is only a necessary structure to do layer_map update.
+            //     updates.flush() will actually apply the updates to the layer map.
             let mut updates = self.layer_map.batch_update();
             Self::insert_historic_layer(l.as_ref().clone(), &mut updates, &mut self.layer_fmgr);
             metrics.record_new_file_metrics(l.layer_desc().file_size);
@@ -188,6 +226,10 @@ impl LayerManager {
     }
 
     /// Called when compaction is completed.
+    ///
+    /// XI: 1. Insert the compact_to layers to the layer map and file manager.
+    ///     2. Remove the compact_from layers from the layer map and file manager.
+    ///     This may cause rebuilding the layer map index.
     pub(crate) fn finish_compact_l0(
         &mut self,
         layer_removal_cs: &Arc<tokio::sync::OwnedMutexGuard<()>>,
@@ -207,6 +249,8 @@ impl LayerManager {
     }
 
     /// Called when garbage collect the timeline. Returns a guard that will apply the updates to the layer map.
+    ///
+    /// XI: Delete the doomed layers from the layer map and file manager.
     pub(crate) fn finish_gc_timeline(
         &mut self,
         layer_removal_cs: &Arc<tokio::sync::OwnedMutexGuard<()>>,
@@ -225,6 +269,11 @@ impl LayerManager {
     }
 
     /// Helper function to insert a layer into the layer map and file manager.
+    ///
+    /// XI: $updates is the layer_map index (maps from LSN-Key-Range to Layer Descriptor).
+    ///     $mapping is the file manager (maps from Layer Descriptor to Layer).
+    ///     $updates is the necessary structure to do layer_map update.
+    ///     updates.flush() will actually apply the updates to the layer map. (auto called by Drop())
     fn insert_historic_layer(
         layer: Layer,
         updates: &mut BatchedUpdates<'_>,
@@ -260,9 +309,11 @@ impl LayerManager {
     }
 }
 
+//XI: The default T is Layer, so the LayerFileManager is a map from PersistentLayerKey to Layer.
 pub(crate) struct LayerFileManager<T>(HashMap<PersistentLayerKey, T>);
 
 impl<T: AsLayerDesc + Clone> LayerFileManager<T> {
+    // XI: Get a layer from the hashmap by a PersistentLayerDesc.
     fn get_from_desc(&self, desc: &PersistentLayerDesc) -> T {
         // The assumption for the `expect()` is that all code maintains the following invariant:
         // A layer's descriptor is present in the LayerMap => the LayerFileManager contains a layer for the descriptor.
@@ -273,6 +324,7 @@ impl<T: AsLayerDesc + Clone> LayerFileManager<T> {
             .clone()
     }
 
+    //XI: Overwrite the layer with the same key.
     pub(crate) fn insert(&mut self, layer: T) {
         let present = self.0.insert(layer.layer_desc().key(), layer.clone());
         if present.is_some() && cfg!(debug_assertions) {
