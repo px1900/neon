@@ -126,6 +126,10 @@ const WILL_INIT: u64 = 1;
 #[derive(Debug, Serialize, Deserialize, Copy, Clone)]
 pub struct BlobRef(pub u64);
 
+/// XI: There are 64 bits in BlobRef, the first bit is used to indicate whether
+/// this blob is a will_init blob, and the rest 63 bits are used to store the
+/// offset of the blob.
+
 impl BlobRef {
     pub fn will_init(&self) -> bool {
         (self.0 & WILL_INIT) != 0
@@ -144,6 +148,9 @@ impl BlobRef {
     }
 }
 
+/// XI Note:
+/// DELTA_KEY = PAGE_KEY (KEY_SIZE) + LSN (SIZE=8)
+/// The unit of size is byte, not bit. So the LSN length is 8 bytes.
 pub const DELTA_KEY_SIZE: usize = KEY_SIZE + 8;
 struct DeltaKey([u8; DELTA_KEY_SIZE]);
 
@@ -411,6 +418,7 @@ impl DeltaLayerWriterInner {
             .await
     }
 
+    /// Index is a B-Tree, the key format is bytes [key, lsn], and the value is offset
     async fn put_value_bytes(
         &mut self,
         key: Key,
@@ -610,6 +618,10 @@ impl Drop for DeltaLayerWriter {
 }
 
 impl DeltaLayerInner {
+    // 1. Open the file from disk
+    // 2. Read the summary block (block 0)
+    // 3. Extract the index start and root block numbers from the summary
+    // 4. Return a new DeltaLayerInner with the file and the index block numbers
     pub(super) async fn load(
         path: &Utf8Path,
         summary: Option<Summary>,
@@ -643,6 +655,19 @@ impl DeltaLayerInner {
         })
     }
 
+    // XI: For the BTree Index, the key is DeltaKey (pageID+LSN), so the pages with same PageID will
+    //     aggregated together. For example (format: pageID_lsn):
+    //     A_100, A_105, A_130, B_103, B_110, B_120, C_95, C_200 ...
+    // This function works as follow:
+    // 1. Scan the BTree index. For example, the parameter key is B, and the lsn_range is 110-150.
+    // 2. The BTree scan key is B_150, and the direction is backwards. So, the first entry we get is
+    //    B_120, and the next entry is B_110, and the next entry is B_103.
+    // 3. When it found B_103's lsn is smaller than 110, it will stop visiting.
+    // 4. By visiting the BTree index, we can get the offset of the B_120 and B_110
+    // 5. Then the function will read the WAL record from blob using the offsets list.
+    // 6. The result is a struct ValueReconstructResult, which contains the Image and WalRecord list.
+    //    For the image field in result, i guess it will hold the extending relation pages which not
+    //    contained by WAL records.
     pub(super) async fn get_value_reconstruct_data(
         &self,
         key: Key,
@@ -662,16 +687,22 @@ impl DeltaLayerInner {
 
         let mut offsets: Vec<(Lsn, u64)> = Vec::new();
 
+        //XI: the search key is relationID+endLSN, and direction is backwards.
+        // So, the first entry we get is the latest(LSN) entry for this relation
+        // and the next entry is the second latest entry for this relation.
         tree_reader
             .visit(
                 &search_key.0,
                 VisitDirection::Backwards,
                 |key, value| {
                     let blob_ref = BlobRef(value);
+                    // XI: key[..KEY_SIZE] is relation id.
+                    // If the key is not the same as the search key, just stop visiting
                     if key[..KEY_SIZE] != search_key.0[..KEY_SIZE] {
                         return false;
                     }
                     let entry_lsn = DeltaKey::extract_lsn_from_buf(key);
+                    // XI: if the entry_lsn is less than the start of the lsn range, just stop visiting
                     if entry_lsn < lsn_range.start {
                         return false;
                     }
@@ -705,7 +736,13 @@ impl DeltaLayerInner {
                     file.file.path
                 )
             })?;
+            //XI: reconstruct_state is a struct, first field is Image and second field is WalRecord List.
             match val {
+                //XI: will this Value::Image reachable? Since the WAL record with full pages
+                //    are classified as Value::WalRecord with will_init flag equals to true.
+                // Update: For extending a relation, postgreSQL will firstly allocate a new page
+                //         and then write the WAL record to the new page. So, the Value::Image is
+                //         to store this kinds like extended pages, i guess.
                 Value::Image(img) => {
                     reconstruct_state.img = Some((entry_lsn, img));
                     need_image = false;
@@ -732,6 +769,7 @@ impl DeltaLayerInner {
         }
     }
 
+    //XI: Iterate all keys in the BTree index from the first key to the last key.
     pub(super) async fn load_keys<'a>(
         &'a self,
         ctx: &RequestContext,

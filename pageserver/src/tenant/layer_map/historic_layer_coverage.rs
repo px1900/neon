@@ -94,6 +94,8 @@ impl<Value: Clone> HistoricLayerCoverage<Value> {
         // XI: Get the latest version map. And then check whether this maps oldest LSN
         //     is larger than the inserting layer's oldest LSN. If yes, panic.
         //     One question, why don't directly use the self.head to check?
+        // The next_back() returns the last k-v pair (LSN, BTreeMap) in the map.
+        // So the last_entry.0 is the LSN.
         // It's only a persistent map, not a retroactive one
         if let Some(last_entry) = self.historic.iter().next_back() {
             let last_lsn = last_entry.0;

@@ -54,6 +54,8 @@ pub(super) async fn connection_manager_loop_step(
     ctx: &RequestContext,
     manager_status: &std::sync::RwLock<Option<ConnectionManagerStatus>>,
 ) -> ControlFlow<(), ()> {
+    //XI: Send a subscribe request to the broker
+    //XI: Subscribe a timeline's status. If the timeline status is ACTIVE, it will got OK()
     match connection_manager_state
         .timeline
         .wait_to_become_active(ctx)
@@ -69,6 +71,7 @@ pub(super) async fn connection_manager_loop_step(
         }
     }
 
+    //XI: Update Metrics Info
     WALRECEIVER_ACTIVE_MANAGERS.inc();
     scopeguard::defer! {
         WALRECEIVER_ACTIVE_MANAGERS.dec();
@@ -101,6 +104,8 @@ pub(super) async fn connection_manager_loop_step(
         //  - receive updates from broker
         //      - this might change the current desired connection
         //  - timeline state changes to something that does not allow walreceiver to run concurrently
+
+        // XI: Here is the position to receive WAL from safekeeper
         select! {
             Some(wal_connection_update) = async {
                 match connection_manager_state.wal_connection.as_mut() {
@@ -220,9 +225,12 @@ async fn subscribe_for_timeline_updates(
     id: TenantTimelineId,
 ) -> Streaming<SafekeeperTimelineInfo> {
     let mut attempt = 0;
+    // XI: Get the shutdown token, if this token is triggered, then it means this task
+    //     is cancelled.
     let cancel = shutdown_token();
 
     loop {
+        //XI: Check the task status
         exponential_backoff(
             attempt,
             DEFAULT_BASE_BACKOFF_SECONDS,
@@ -241,6 +249,8 @@ async fn subscribe_for_timeline_updates(
             subscription_key: Some(key),
         };
 
+        //XI: Subscribe the safekeeper info. For now, this connection manager share the underlying TCP connection
+        //    with other streams on this client (other connection managers).
         match broker_client.subscribe_safekeeper_info(request).await {
             Ok(resp) => {
                 return resp.into_inner();

@@ -90,6 +90,9 @@ pub struct LayerMap {
 
     /// L0 layers have key range Key::MIN..Key::MAX, and locating them using R-Tree search is very inefficient.
     /// So L0 layers are held in l0_delta_layers vector, in addition to the R-tree.
+    ///
+    /// XI: It seems L0 layer only store the descriptors of the layers, not the actual data.
+    ///     And based on LSM-Tree knowledge, the L0 layer's descriptors may have key-range overlap with each other.
     l0_delta_layers: Vec<Arc<PersistentLayerDesc>>,
 }
 
@@ -182,12 +185,14 @@ impl LayerMap {
     /// 'open' and 'frozen' layers!
     ///
     pub fn search(&self, key: Key, end_lsn: Lsn) -> Option<SearchResult> {
+        // XI: The latest version that start.lsn < end_lsn
         let version = self.historic.get().unwrap().get_version(end_lsn.0 - 1)?;
         let latest_delta = version.delta_coverage.query(key.to_i128());
         let latest_image = version.image_coverage.query(key.to_i128());
 
         match (latest_delta, latest_image) {
             (None, None) => None,
+            // XI: if there is only an image layer, return this image layer descriptor and its lsn
             (None, Some(image)) => {
                 let lsn_floor = image.get_lsn_range().start;
                 Some(SearchResult {
@@ -195,6 +200,7 @@ impl LayerMap {
                     lsn_floor,
                 })
             }
+            // XI: If this is a delta layer, return this delta layer descriptor and its start lsn
             (Some(delta), None) => {
                 let lsn_floor = delta.get_lsn_range().start;
                 Some(SearchResult {
@@ -202,7 +208,12 @@ impl LayerMap {
                     lsn_floor,
                 })
             }
+            // XI: If there is both a delta layer and an image layer, return the newer one
+            //     If image layer is newer, just return it normally
+            //     If delta layer is newer, return it and return the floor lsn greater than the image layer's start lsn
+            //        In this way, the image layer can be searched again in the next search
             (Some(delta), Some(image)) => {
+                //XI: Image layer's lsn range is [lsn, lsn+1)
                 let img_lsn = image.get_lsn_range().start;
                 let image_is_newer = image.get_lsn_range().end >= delta.get_lsn_range().end;
                 let image_exact_match = img_lsn + 1 == end_lsn;
@@ -234,13 +245,19 @@ impl LayerMap {
     /// Helper function for BatchedUpdates::insert_historic
     ///
     /// TODO(chi): remove L generic so that we do not need to pass layer object.
+    /// XI: Insert this layer into the historic layer coverage.
+    ///     If this is an L0 layer, also insert it into l0_delta_layers.
+    ///     Question: How to understand the L0 layer? Is this logical layer include several physical layer descriptors?
     pub(self) fn insert_historic_noflush(&mut self, layer_desc: PersistentLayerDesc) {
         // TODO: See #3869, resulting #4088, attempted fix and repro #4094
 
+        // XI: For the L0 layer, there are no exact key range, which means the
+        //     the key.start==const.KEY_MIN and key.end==const.KEY_MAX
         if Self::is_l0(&layer_desc) {
             self.l0_delta_layers.push(layer_desc.clone().into());
         }
 
+        // XI: this insert operation will be temporarily cached in the historic layer coverage.
         self.historic.insert(
             historic_layer_coverage::LayerKey::from(&layer_desc),
             layer_desc.into(),
@@ -252,10 +269,14 @@ impl LayerMap {
     ///
     /// Helper function for BatchedUpdates::remove_historic
     ///
+    /// XI: Remove this layer from historic layer coverage.
+    ///     If this is a L0 layer, also remove it from l0_delta_layers.
     pub fn remove_historic_noflush(&mut self, layer_desc: &PersistentLayerDesc) {
+        // XI: This remove operation will temporarily be cached in the historic layer coverage.
         self.historic
             .remove(historic_layer_coverage::LayerKey::from(layer_desc));
         let layer_key = layer_desc.key();
+        // XI: If this is a L0 layer, remove it from l0_delta_layers
         if Self::is_l0(layer_desc) {
             let len_before = self.l0_delta_layers.len();
             let mut l0_delta_layers = std::mem::take(&mut self.l0_delta_layers);
@@ -273,6 +294,8 @@ impl LayerMap {
     }
 
     /// Helper function for BatchedUpdates::drop.
+    /// XI: Before calling flush_updates, the updating operations are cached in historic's buffer.
+    ///     By calling this function, the buffer will be flushed to Persistent BST
     pub(self) fn flush_updates(&mut self) {
         self.historic.rebuild();
     }
@@ -283,12 +306,18 @@ impl LayerMap {
     ///
     /// This is used for garbage collection, to determine if an old layer can
     /// be deleted.
+    ///
+    /// XI: For a specific LSN, there is a version of Persistent BST.
+    /// For this specific version, there is one image_coverage and one delta_coverage.
+    /// one image_coverage doesn't mean these layers share same LSN. In fact, there are layers with
+    /// different key-range and corresponding different LSNs.
     pub fn image_layer_exists(&self, key: &Range<Key>, lsn: &Range<Lsn>) -> Result<bool> {
         if key.is_empty() {
             // Vacuously true. There's a newer image for all 0 of the kerys in the range.
             return Ok(true);
         }
 
+        //XI: Get the latest version that lsn_range.end_lsn < lsn.end
         let version = match self.historic.get().unwrap().get_version(lsn.end.0 - 1) {
             Some(v) => v,
             None => return Ok(false),
@@ -297,15 +326,33 @@ impl LayerMap {
         let start = key.start.to_i128();
         let end = key.end.to_i128();
 
+        //XI: This Closure will check whether one layer's start LSN is greater than or equal to the given LSN
+        //    Question, why don't need to check get_lsn_range().start < lsn.end?
+        //    Perhaps, this function's working scenario is: it found a old image layer, and wanna know whether this
+        //    layer can be deleted. So, it will check whether these is a layer newer than this old image layer(only need
+        //    to check the parameter lsn_range.start), and also cover this old image layer's key range.
         let layer_covers = |layer: Option<Arc<PersistentLayerDesc>>| match layer {
             Some(layer) => layer.get_lsn_range().start >= lsn.start,
             None => false,
         };
 
+
+        // XI: Parameter key_range = [100, 300]
+        //     image_coverage: [90-110, 110-130, 130-190, 190-220]
+
         // Check the start is covered
+        //XI: version.image_coverage.query(start) will find the last layer that key.start <= start
+        //    If one layer's key.start > start, it means this layer's key range can't cover the parameter key range
+        //    Then check whether this layer's start LSN is greater than parameter lsn_range.start
+        //    Either of the two conditions is not satisfied, return false
+        //    This check actually check [90-110]'s lsn range
         if !layer_covers(version.image_coverage.query(start)) {
             return Ok(false);
         }
+
+        // XI: In fact, this parameter key-range may consist of several sub-ranges, and each sub-range
+        //     should be checked. Any sub-range doesn't satisfy the LSN condition, return false
+        //     This for loop will check [110-130, 130-190, 190-220]
 
         // Check after all changes of coverage
         for (_, change_val) in version.image_coverage.range(start..end) {
@@ -317,6 +364,7 @@ impl LayerMap {
         Ok(true)
     }
 
+    //XI: Iterate the current layer coverage
     pub fn iter_historic_layers(&self) -> impl '_ + Iterator<Item = Arc<PersistentLayerDesc>> {
         self.historic.iter()
     }
@@ -339,6 +387,8 @@ impl LayerMap {
             None => return Ok(vec![]),
         };
 
+        //XI: Let's assume the key_range is [100, 300]
+        //    The image_coverage is [90-110, 110-130, 130-190, 190-220]
         let start = key_range.start.to_i128();
         let end = key_range.end.to_i128();
 
@@ -346,6 +396,15 @@ impl LayerMap {
         let mut coverage: Vec<(Range<Key>, Option<Arc<PersistentLayerDesc>>)> = vec![];
         let mut current_key = start;
         let mut current_val = version.image_coverage.query(start);
+        //XI: Up to now, the current_key = 100, current_val = [90-110]
+
+        //XI: For the first loop: change_key = 110, change_val = [110-130]
+        //    kr = 100..110, coverage.push([90-110])
+        //    current_key = 110, current_val = [110-130]
+        //    For the second loop: change_key = 130, change_val = [130-190]
+        //    kr = 110..130, coverage.push([110-130])
+        //    current_key = 130, current_val = [130-190]
+        //    So on and so forth ...
 
         // Loop through the change events and push intervals
         for (change_key, change_val) in version.image_coverage.range(start..end) {
@@ -410,6 +469,16 @@ impl LayerMap {
     /// This number is used to compute the largest number of deltas that
     /// we'll need to visit for any page reconstruction in this region.
     /// We use this heuristic to decide whether to create an image layer.
+    ///
+    /// XI: Using the recursion to count the number of delta layers with provided key and lsn range
+    ///  To understand this function, firstly, for one specific key, there may be several delta layers.
+    ///  Each delta layer stands for a version between [lsn_start, lsn_end).
+    ///  So, this function will firstly find the lasted version smaller(elder) than lsn.end.
+    ///  Let assume, this version's lsn-range is [100, 120) and parameter lsn range is [30, 110),
+    ///     then the result equal to "count_deltas( [30, 100) ) +1" -> Recursion function
+    ///
+    ///  But remember, the delta_coverage consists of several sub-ranges, and each sub-range is a delta layer.
+    ///  So, for each sub-range, it will call count_deltas recursively. And the result is the maximum value of all sub-ranges.
     pub fn count_deltas(
         &self,
         key: &Range<Key>,
@@ -442,10 +511,12 @@ impl LayerMap {
         for (change_key, change_val) in version.delta_coverage.range(start..end) {
             // If there's a relevant delta in this part, add 1 and recurse down
             if let Some(val) = current_val {
+                //XI: val.get_lsn_range().end > lsn.start means this layer would be accessed during reconstructing
                 if val.get_lsn_range().end > lsn.start {
                     let kr = Key::from_i128(current_key)..Key::from_i128(change_key);
                     let lr = lsn.start..val.get_lsn_range().start;
                     if !kr.is_empty() {
+                        //XI: Need to understand the meaning of is_reimage_worthy()
                         let base_count = Self::is_reimage_worthy(&val, key) as usize;
                         let new_limit = limit.map(|l| l - base_count);
                         let max_stacked_deltas_underneath =

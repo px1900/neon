@@ -74,12 +74,20 @@ impl AsLayerDesc for Layer {
 
 impl Layer {
     /// Creates a layer value for a file we know to not be resident.
+    /// XI: This function will create a layer (delta or image) from a filename.
+    ///     And the layer will only be stored in remote by specifying the LayerResidenceStatus as Evicted.
+    /// XI: As LayerResidenceStatus indicates, there are two types of residence status: Resident and Evicted.
+    ///     For the Resident status, the layer exists locally and maybe also exists in remote.
+    ///     For the Evicted status, the layer exists in remote but not locally.
+    /// XI: This file_name is not a string path, but a struct which contains key range and LSN range (one LSN value for image layer)
     pub(crate) fn for_evicted(
         conf: &'static PageServerConf,
         timeline: &Arc<Timeline>,
         file_name: LayerFileName,
         metadata: LayerFileMetadata,
     ) -> Self {
+        // Create a layer descriptor from a filename.
+        // The layer will either be a delta or an image layer, depending on the filename.
         let desc = PersistentLayerDesc::from_filename(
             timeline.tenant_id,
             timeline.timeline_id,
@@ -152,6 +160,7 @@ impl Layer {
 
     /// Creates a Layer value for freshly written out new layer file by renaming it from a
     /// temporary path.
+    /// XI: Create a layer object and then rename the temporary file to the correct path.
     pub(crate) fn finish_creating(
         conf: &'static PageServerConf,
         timeline: &Arc<Timeline>,
@@ -160,7 +169,13 @@ impl Layer {
     ) -> anyhow::Result<ResidentLayer> {
         let mut resident = None;
 
+        //Closure to create a new Layer
+        //XI: DownloadedLayer means we have the layer locally, and can be evicted later.
+        //XI: DownloadedLayer.inner -> LayerInner
+        //XI: LayerInner.inner -> ResidentOrWantedEvicted
+        //XI: The input of $owner is the Layer itself. ??? Not sure here
         let owner = Layer(Arc::new_cyclic(|owner| {
+            //XI: Let inner be the DownloadedLayer, and the inner of DownloadedLayer is a InnerLayer
             let inner = Arc::new(DownloadedLayer {
                 owner: owner.clone(),
                 kind: tokio::sync::OnceCell::default(),
@@ -172,6 +187,7 @@ impl Layer {
                 LayerResidenceStatus::Resident,
                 LayerResidenceEventReason::LayerCreate,
             );
+            //XI: Transfer the downloadedLayer as the parameter to LayerInner::new() function.
             LayerInner::new(
                 conf,
                 timeline,
@@ -200,6 +216,7 @@ impl Layer {
     ///
     /// Technically cancellation safe, but cancelling might shift the viewpoint of what generation
     /// of download-evict cycle on retry.
+    /// XI: todo
     pub(crate) async fn evict_and_wait(
         &self,
         rtc: &RemoteTimelineClient,
@@ -360,6 +377,9 @@ impl ResidentOrWantedEvicted {
     /// Returns `Some` if this was the first time eviction was requested. Care should be taken to
     /// drop the possibly last strong reference outside of the mutex of
     /// heavier_once_cell::OnceCell.
+    /// XI: Change the status from Resident to WantedEvicted.
+    ///     For the first time request, it will return Some.
+    ///     For the second or later time request, it will have no effect and return None.
     fn downgrade(&mut self) -> Option<Arc<DownloadedLayer>> {
         match self {
             ResidentOrWantedEvicted::Resident(strong) => {
@@ -443,6 +463,7 @@ enum Status {
     Downloaded,
 }
 
+//XI: todo
 impl Drop for LayerInner {
     fn drop(&mut self) {
         if !*self.wanted_garbage_collected.get_mut() {
@@ -513,6 +534,8 @@ impl Drop for LayerInner {
 }
 
 impl LayerInner {
+    //XI: Create a LayerInner object.
+    //XI: LayerInner.inner = ResidentOrWantedEvicted(downloaded)
     fn new(
         conf: &'static PageServerConf,
         timeline: &Arc<Timeline>,
@@ -563,6 +586,9 @@ impl LayerInner {
         }
     }
 
+    //XI: Call DownloadedLayer.downgrade() function and set wanted_evicted flag to true.
+    //    Then wait for the response from the broadcast channel.
+    //    If the response is Evicted, return Ok(()). Else, return Err(EvictionError::Downloaded).
     pub(crate) async fn evict_and_wait(
         &self,
         _: &RemoteTimelineClient,
@@ -626,6 +652,7 @@ impl LayerInner {
                 let next_version = 1 + self.version.fetch_add(1, Ordering::Relaxed);
 
                 // no need to make the evict_and_wait wait for the actual download to complete
+                //XI: Set the global status to Downloaded?
                 drop(self.status.send(Status::Downloaded));
 
                 let timeline = self
@@ -644,6 +671,7 @@ impl LayerInner {
                     .await
                     .map_err(DownloadError::PreStatFailed)?;
 
+                // XI: needs_download means the file was not downloaded by previous cancelled attempts.
                 if let Some(reason) = needs_download {
                     // only reset this after we've decided we really need to download. otherwise it'd
                     // be impossible to mark cancelled downloads for eviction, like one could imagine
@@ -666,6 +694,7 @@ impl LayerInner {
                         return Err(DownloadError::DownloadRequired);
                     }
 
+                    //XI: Download the file from remote storage.
                     self.spawn_download_and_wait(timeline).await?;
                 } else {
                     // the file is present locally, probably by a previous but cancelled call to
@@ -687,6 +716,7 @@ impl LayerInner {
                 Ok(ResidentOrWantedEvicted::Resident(res))
             };
 
+            //XI: todo
             let (weak, _permit) = {
                 // should we be able to give the permit to the `get_or_init`? would make sense.
                 drop(permit.take());
@@ -1133,6 +1163,9 @@ impl DownloadedLayer {
     /// `owner` parameter is a strong reference at the same `LayerInner` as the
     /// `DownloadedLayer::owner` would be when upgraded. Given how this method ends up called,
     /// we will always have the LayerInner on the callstack, so we can just use it.
+    /// XI: Call load function of actual ImageLayer or DeltaLayer.
+    ///     TODO, needs to understand the layout of this DownloadedLayer. The owner is a weak reference to LayerInner.
+    ///     How does this structure work?
     async fn get<'a>(
         &'a self,
         owner: &Arc<LayerInner>,

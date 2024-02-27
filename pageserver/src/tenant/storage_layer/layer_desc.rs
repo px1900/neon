@@ -130,6 +130,8 @@ impl PersistentLayerDesc {
     /// Get a delta file name for this layer.
     ///
     /// Panic: if this is not a delta layer.
+    /// XI: delta lsn range is a real range. image lsn range is not.
+    ///     For the image layer, it is a snapshot at one LSN, so the end is always the start + 1.
     pub fn delta_file_name(&self) -> DeltaFileName {
         assert!(self.is_delta);
         DeltaFileName {
@@ -180,6 +182,11 @@ impl PersistentLayerDesc {
     /// or does it contain a version of every page? This is important to know
     /// for garbage collecting old layers: an incremental layer depends on
     /// the previous non-incremental layer.
+    /// XI: It seems is_incremental is the same as is_delta.
+    ///     For the incremental definition, if one layer contains a version for
+    ///     every page in the specific key range, it is a non-incremental layer.
+    ///     Otherwise, it is an incremental layer.
+    ///     So, this is the same as is_delta.
     pub fn is_incremental(&self) -> bool {
         self.is_delta
     }

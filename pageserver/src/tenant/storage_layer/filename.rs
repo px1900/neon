@@ -218,6 +218,14 @@ impl LayerFileName {
 
     /// Determines if this layer file is considered to be in future meaning we will discard these
     /// layers during timeline initialization from the given disk_consistent_lsn.
+    /// XI: This function is used when creating a new timeline.
+    ///     For example, the current timeline is:
+    ///        image_1, delta_2, delta_3, delta_4
+    ///     You want to create a new timeline from the delta_2.
+    ///        image_1, delta_2, delta_3, delta_4
+    ///                         -> delta_new_3, delta_new_4
+    ///     The disk_consistent_lsn is the LSN of the delta_2.
+    ///     So, for this function, the delta_3 and delta_4 are in the future and should be discarded.
     pub(crate) fn is_in_future(&self, disk_consistent_lsn: Lsn) -> bool {
         use LayerFileName::*;
         match self {

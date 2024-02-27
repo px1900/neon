@@ -63,6 +63,8 @@ impl std::fmt::Debug for InMemoryLayer {
 ///     page_a: VecMap<lsn, offset>
 ///     page_b: VecMap<lsn, offset>
 ///     ...
+/// XI: The layer will organize the incoming page version or WAL record based on LSN and pageID.
+///     After this layer is full, this layer will be frozen and written to delta layer or image layer.
 pub struct InMemoryLayerInner {
     /// All versions of all pages in the layer are kept here.  Indexed
     /// by block number and LSN. The value is an offset into the
@@ -353,7 +355,11 @@ impl InMemoryLayer {
     /// Returns a new delta layer with all the same data as this in-memory layer
     /// Xi Note:
     ///
-    /// todo
+    /// 1. Grab the read lock
+    /// 2. Get all keys from the in-memory layer, and then sort them by pageID
+    /// 3. For each key, read its value from blob, and then write it into the new delta layer.
+    /// 4. Call delta_layer.finish to flush delta layer's value and index to disk.
+    /// 5. Return the new delta layer to caller.
     pub(crate) async fn write_to_disk(
         &self,
         timeline: &Arc<Timeline>,

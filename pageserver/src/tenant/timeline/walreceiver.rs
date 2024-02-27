@@ -65,6 +65,7 @@ pub struct WalReceiver {
 }
 
 impl WalReceiver {
+    //XI: Get connected to the broker and start the WAL receiver manager
     pub fn start(
         timeline: Arc<Timeline>,
         conf: WalReceiverConf,

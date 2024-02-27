@@ -135,7 +135,7 @@ impl<Value: Clone> LayerCoverage<Value> {
     /// If the tree has five nodes: key_1, key_50, key_100, key_150, key_200
     /// The key_1 manages the key range [1, 50)
     /// The key_50 manages the key range [50, 100) and so on.
-    /// So, for example, there is a key_60 coming.
+    /// So, for example, there is a key_60 coming, the range() will search the range [key_1, key_60)
     /// The range() will return [key_1, key_50],
     ///    then the next_back() will return key_50, which manages the key_60
     pub fn query(&self, key: i128) -> Option<Value> {
