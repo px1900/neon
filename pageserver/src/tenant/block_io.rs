@@ -120,6 +120,7 @@ impl<'a> BlockReaderRef<'a> {
 /// // do stuff with 'buf'
 /// ```
 ///
+/// XI: Points to its own reader, so that it can be used as a drop-in replacement for the reader
 pub struct BlockCursor<'a> {
     reader: BlockReaderRef<'a>,
 }
@@ -169,6 +170,7 @@ impl FileBlockReader {
     }
 
     /// Read a page from the underlying file into given buffer.
+    /// XI: blkno is the target block that will be read
     async fn fill_buffer(&self, buf: &mut [u8], blkno: u32) -> Result<(), std::io::Error> {
         assert!(buf.len() == PAGE_SZ);
         self.file
@@ -180,6 +182,13 @@ impl FileBlockReader {
     /// Returns a "lease" object that can be used to
     /// access to the contents of the page. (For the page cache, the
     /// lease object represents a lock on the buffer.)
+    ///
+    /// XI: Read a block to the PageCache, and return this PageCache's Lease to enable the caller
+    ///     to access the contents of the page.
+    ///     For each block, there is an associated file_id, which is used as a key in the page cache.
+    ///     If this block is found in the page cache, then return the lease object that represents a lock on the buffer.
+    ///     If this block is not found in the page cache, then read the page from the underlying file into the PageCache,
+    ///        and return the lease of new PageCache object.
     pub async fn read_blk(
         &self,
         blknum: u32,
@@ -231,6 +240,7 @@ pub struct BlockBuf {
     pub blocks: Vec<Bytes>,
 }
 impl BlockWriter for BlockBuf {
+    //XI: Return the start block number of the newly written page
     fn write_blk(&mut self, buf: Bytes) -> Result<u32, std::io::Error> {
         assert!(buf.len() == PAGE_SZ);
         let blknum = self.blocks.len();
