@@ -31,19 +31,29 @@ impl<'a> BlockCursor<'a> {
     }
     /// Read blob into the given buffer. Any previous contents in the buffer
     /// are overwritten.
+    ///
+    /// XI: This function is implemented using block io.
+    ///     1. Read the first block and get the length of the blob
+    ///     2. Continuously read the data using the block io and extend the buffer with the data
+    ///        until it gets the whole blob
     pub async fn read_blob_into_buf(
         &self,
         offset: u64,
         dstbuf: &mut Vec<u8>,
         ctx: &RequestContext,
     ) -> Result<(), std::io::Error> {
+        //XI: Calculate the block number and offset inside the block
         let mut blknum = (offset / PAGE_SZ as u64) as u32;
         let mut off = (offset % PAGE_SZ as u64) as usize;
 
+        //XI: Read the first block of this blob
         let mut buf = self.read_blk(blknum, ctx).await?;
 
         // peek at the first byte, to determine if it's a 1- or 4-byte length
         let first_len_byte = buf[off];
+
+        //XI: Get the length of the blob. It use the first_byte to tell whether the length use 1 or
+        //    4 bytes to store
         let len: usize = if first_len_byte < 0x80 {
             // 1-byte length header
             off += 1;
@@ -67,10 +77,12 @@ impl<'a> BlockCursor<'a> {
             u32::from_be_bytes(len_buf) as usize
         };
 
+        //XI: dstbuf is the buffer to store the blob
         dstbuf.clear();
         dstbuf.reserve(len);
 
         // Read the payload
+        // XI: Continuously read current block's data to buf, and then extend the dstbuf with the data in buf
         let mut remain = len;
         while remain > 0 {
             let mut page_remain = PAGE_SZ - off;
@@ -81,6 +93,7 @@ impl<'a> BlockCursor<'a> {
                 off = 0;
                 page_remain = PAGE_SZ;
             }
+            //XI: How many data should be read from this block
             let this_blk_len = min(remain, page_remain);
             dstbuf.extend_from_slice(&buf[off..off + this_blk_len]);
             remain -= this_blk_len;
@@ -95,6 +108,16 @@ impl<'a> BlockCursor<'a> {
 /// If a `BlobWriter` is dropped, the internal buffer will be
 /// discarded. You need to call [`flush_buffer`](Self::flush_buffer)
 /// manually before dropping.
+///
+/// XI: What is the purpose of offset? Does it represent the currently occupied buffer size?
+///     Updates: the offset donates how much data has been written to the file.
+///
+///    1. It will use write_blob to write a blob to the file
+///    2. During the write_blob, it will write the length of the blob and data separately.
+///    3. For each writing, it will call the write_all function to write the data.
+///    4. The data to be written will be firstly written to the buffer, and then flush the buffer to the file.
+///    5. When we try to write some data to blob, firstly we need to check whether there are some
+///       data unflushed and cached inside the write->buffer.
 pub struct BlobWriter<const BUFFERED: bool> {
     inner: VirtualFile,
     offset: u64,
@@ -146,6 +169,13 @@ impl<const BUFFERED: bool> BlobWriter<BUFFERED> {
     }
 
     /// Internal, possibly buffered, write function
+    ///
+    /// XI: If BUFFERED feature is disabled, then write the src_buf directly to the file
+    ///     If BUFFERED feature is enabled, then:
+    ///     1. If there already have some data in the buffer, then to save disk-flushing cost, we
+    ///       firstly write as much parameter src_buf to the buffer as it fits, and flush the whole
+    ///       buffer once to the file. Then, write the remaining src_buf to the file bypassing buffer.
+    ///     2. If the buffer is empty, then write the src_buf directly to the file.
     async fn write_all(&mut self, mut src_buf: &[u8]) -> Result<(), Error> {
         if !BUFFERED {
             assert!(self.buf.is_empty());
@@ -181,6 +211,10 @@ impl<const BUFFERED: bool> BlobWriter<BUFFERED> {
 
     /// Write a blob of data. Returns the offset that it was written to,
     /// which can be used to retrieve the data later.
+    ///
+    /// XI: This function works to write a blob to the file.
+    ///     Firstly, it write the length of the blob to the file
+    ///     Then, it write the blob data to the file
     pub async fn write_blob(&mut self, srcbuf: &[u8]) -> Result<u64, Error> {
         let offset = self.offset;
 
@@ -205,6 +239,10 @@ impl<const BUFFERED: bool> BlobWriter<BUFFERED> {
     }
 }
 
+//XI: There are two types of BlobWriter, one is with BUFFERED feature, and the other is without BUFFERED feature
+//    With BUFFERED, during get the virtual file, it has two approach: flushing the buffer before giving access
+//    or giving access without flushing buffer.
+//    Without BUFFERED, it only have into_inner, which doesn't involve buffer.
 impl BlobWriter<true> {
     /// Access the underlying `VirtualFile`.
     ///
