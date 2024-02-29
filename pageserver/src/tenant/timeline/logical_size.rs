@@ -17,6 +17,10 @@ use std::sync::Arc;
 /// 2. Collecting an incremental part and adding that to the initial size.
 /// Increments are appended on walreceiver writing new timeline data,
 /// which result in increase or decrease of the logical size.
+///
+///
+/// XI: The first three fields are used to calculate the initial size of the logical size of the timeline.
+///     The last field is used to calculate the logical size after operations.
 pub(super) struct LogicalSize {
     /// Size, potentially slow to compute. Calculating this might require reading multiple
     /// layers, and even ancestor's layers.
@@ -55,6 +59,11 @@ pub(super) struct LogicalSize {
 }
 
 /// Normalized current size, that the data in pageserver occupies.
+///
+/// XI: It seems that the approximate size will only cache the size changes and it doesn't apply/calculate the
+///     initial size of the timeline. The exact size will calculate the initial size of the timeline and apply the
+///     increments.
+///     Note that this is an enum
 #[derive(Debug, Clone, Copy)]
 pub(super) enum CurrentLogicalSize {
     /// The size is not yet calculated to the end, this is an intermediate result,
@@ -86,6 +95,7 @@ impl LogicalSize {
         }
     }
 
+    // XI: Create a LogicalSize with semaphore set to 1 and initial_part_end set to the parameter $LSN
     pub(super) fn deferred_initial(compute_to: Lsn) -> Self {
         Self {
             initial_logical_size: OnceCell::new(),
@@ -95,6 +105,8 @@ impl LogicalSize {
         }
     }
 
+    // XI: If the initial_logical_size is not computed, then return an Approximate enum with the increment size
+    //     else, return the Exact enum with the initial_logical_size+increment_size
     pub(super) fn current_size(&self) -> anyhow::Result<CurrentLogicalSize> {
         let size_increment: i64 = self.size_added_after_initial.load(AtomicOrdering::Acquire);
         //                  ^^^ keep this type explicit so that the casts in this function break if
