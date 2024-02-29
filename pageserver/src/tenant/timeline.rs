@@ -1210,6 +1210,7 @@ impl Timeline {
             .unwrap_or(self.conf.default_tenant_conf.image_creation_threshold)
     }
 
+    // XI: 2 policies: NoEviction, LayerAccessThreshold
     fn get_eviction_policy(&self) -> EvictionPolicy {
         let tenant_conf = self.tenant_conf.read().unwrap().tenant_conf;
         tenant_conf

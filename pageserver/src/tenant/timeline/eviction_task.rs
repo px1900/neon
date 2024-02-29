@@ -85,6 +85,7 @@ impl Timeline {
                 EvictionPolicy::LayerAccessThreshold(lat) => lat.period,
                 EvictionPolicy::NoEviction => Duration::from_secs(10),
             };
+            //XI: sleep for a random period of time that is <= period
             if random_init_delay(period, &cancel).await.is_err() {
                 return;
             }
