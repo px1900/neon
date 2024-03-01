@@ -43,6 +43,7 @@ pub struct VirtualFile {
     handle: RwLock<SlotHandle>,
 
     /// Current file position
+    /// XI: This is the reading/writing cursor of the file
     pos: u64,
 
     /// File path and options to use to open it.
@@ -80,6 +81,17 @@ struct SlotHandle {
 /// OPEN_FILES starts in uninitialized state, and it's initialized by
 /// the virtual_file::init() function. It must be called exactly once at page
 /// server startup.
+///
+///
+///
+///
+/// XI:
+/// OpenFiles{
+///  slots_list,  --> Slot{
+///  next,              slot_inner,    --> SlotInner{
+/// }                   recently_used,       tag,
+///                   }                      file,
+///                                        }
 static OPEN_FILES: OnceCell<OpenFiles> = OnceCell::new();
 
 struct OpenFiles {
@@ -110,6 +122,15 @@ impl OpenFiles {
     ///
     /// On return, we hold a lock on the slot, and its 'tag' has been updated
     /// recently_used has been set. It's all ready for reuse.
+    ///
+    ///
+    /// XI: the victim algorithm will iterate through the slots.
+    ///     If the recently_used flag on this slot is set, continue the clock.
+    ///     If the recently_used flag on this slot is not set, try to use this slot.
+    ///     If we iterated through the array twice without finding a victim,
+    ///        just pick the next slot and wait until we can reuse it.
+    ///     After finding the victim slot, close the existing file and increment the tag by one.
+    ///     Then return the SlotHandle back to the caller.
     fn find_victim_slot(&self) -> (SlotHandle, RwLockWriteGuard<SlotInner>) {
         //
         // Run the clock algorithm to find a slot to replace.
@@ -120,6 +141,7 @@ impl OpenFiles {
         let mut slot_guard;
         let index;
         loop {
+            // XI: Iterate through the slots
             let next = self.next.fetch_add(1, Ordering::AcqRel) % num_slots;
             slot = &self.slots[next];
 
@@ -237,6 +259,7 @@ impl VirtualFile {
         let parts = path_str.split('/').collect::<Vec<&str>>();
         let tenant_id;
         let timeline_id;
+        //XI: By default, the path should be: .neon/tenants/<tenant_id>/timelines/<timeline_id>/<filename>
         if parts.len() > 5 && parts[parts.len() - 5] == TENANTS_SEGMENT_NAME {
             tenant_id = parts[parts.len() - 4].to_string();
             timeline_id = parts[parts.len() - 2].to_string();
@@ -244,8 +267,11 @@ impl VirtualFile {
             tenant_id = "*".to_string();
             timeline_id = "*".to_string();
         }
+        //XI: Got slot handle and its lock
         let (handle, mut slot_guard) = get_open_files().find_victim_slot();
 
+        //XI: Open the physical file with metrics and given options
+        //    For now, the target file has already been opened or created if not exists
         let file = STORAGE_IO_TIME_METRIC
             .get(StorageIoOperation::Open)
             .observe_closure_duration(|| open_options.open(path))?;
@@ -256,6 +282,9 @@ impl VirtualFile {
         // explicitly, but OpenOptions doesn't contain any functions to read flags,
         // only to set them.
         let mut reopen_options = open_options.clone();
+        // XI: Because we have already finished the creation, for the following re-open,
+        //     we don't need these create or truncate flags.
+        // XI: Disable the create_new, create, and truncate flags
         reopen_options.create(false);
         reopen_options.create_new(false);
         reopen_options.truncate(false);
@@ -269,6 +298,7 @@ impl VirtualFile {
             timeline_id,
         };
 
+        //XI: Store the physical file descriptor in the target slot
         slot_guard.file.replace(file);
 
         Ok(vfile)
@@ -285,14 +315,19 @@ impl VirtualFile {
         tmp_path: &Utf8Path,
         content: &[u8],
     ) -> Result<(), CrashsafeOverwriteError> {
+        // XI: Find the parent directory of the final path
         let Some(final_path_parent) = final_path.parent() else {
             return Err(CrashsafeOverwriteError::FinalPathHasNoParentDir);
         };
+
+        // XI: Remove the previous tmp file if it exists
         match std::fs::remove_file(tmp_path) {
             Ok(()) => {}
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
             Err(e) => return Err(CrashsafeOverwriteError::RemovePreviousTempfile(e)),
         }
+
+        // XI: Open the tmp file with write and create_new flags
         let mut file = Self::open_with_options(
             tmp_path,
             OpenOptions::new()
@@ -303,6 +338,8 @@ impl VirtualFile {
         )
         .await
         .map_err(CrashsafeOverwriteError::CreateTempfile)?;
+
+        // XI: Write the content to the tmp file and sync it
         file.write_all(content)
             .await
             .map_err(CrashsafeOverwriteError::WriteContents)?;
@@ -318,6 +355,8 @@ impl VirtualFile {
         // the current `find_victim_slot` impl might pick the same slot for both
         // VirtualFile., and it eventually does a blocking write lock instead of
         // try_lock.
+
+        // XI: Sync the directory which containing the final path
         let final_parent_dirfd =
             Self::open_with_options(final_path_parent, OpenOptions::new().read(true))
                 .await
@@ -362,6 +401,8 @@ impl VirtualFile {
                 {
                     let slot = &open_files.slots[handle.index];
                     let slot_guard = slot.inner.read().unwrap();
+                    // XI: Our file descriptor is still valid
+                    //     We can set the recently_used flag to true and reuse this file
                     if slot_guard.tag == handle.tag {
                         if let Some(file) = &slot_guard.file {
                             // Found a cached file descriptor.
@@ -380,6 +421,8 @@ impl VirtualFile {
 
                 // If another thread changed the handle while we were not holding the lock,
                 // then the handle might now be valid again. Loop back to retry.
+                // XI: If the newly grabbed handle is not equal to the previous handle, continue the loop
+                //     This is because maybe another thread has already opened a file, so need to check
                 if *handle_guard != handle {
                     handle = *handle_guard;
                     continue;
@@ -390,6 +433,9 @@ impl VirtualFile {
 
         // We need to open the file ourselves. The handle in the VirtualFile is
         // now locked in write-mode. Find a free slot to put it in.
+        // XI: Reaching here means the previous file descriptor is no longer valid. And for now, we held
+        //     the write lock of the handle. For now, we need to find a free slot and put a newly opened
+        //     file descriptor into it.
         let (handle, mut slot_guard) = open_files.find_victim_slot();
 
         // Open the physical file
@@ -406,6 +452,8 @@ impl VirtualFile {
         // to point to it.
         slot_guard.file.replace(file);
 
+        // XI: Update the handle in the VirtualFile to a new one. So that other threads can know this
+        //     virtual file handler has changed, and may be valid now.
         *handle_guard = handle;
 
         Ok(result)
@@ -469,6 +517,8 @@ impl VirtualFile {
 
     // Copied from https://doc.rust-lang.org/1.72.0/src/std/os/unix/fs.rs.html#219-235
     pub async fn write_all_at(&self, mut buf: &[u8], mut offset: u64) -> Result<(), Error> {
+        //XI: The buf is a pointer. Every time we successfully read a part of the buffer,
+        //    we move the pointer to the next reading position, until we read the whole buffer full.
         while !buf.is_empty() {
             match self.write_at(buf, offset).await {
                 Ok(0) => {
